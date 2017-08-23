@@ -22,6 +22,7 @@
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/Signals.h"
 
 using namespace llvm;
@@ -106,8 +107,23 @@ static cl::opt<bool>
     Verbose("verbose", cl::desc("If set, shows the list of processed files"),
             cl::cat(ClangFormatCategory));
 
+static cl::opt<bool> Recursively("r",
+                                 cl::desc("Recursively search for <file>s."),
+                                 cl::cat(ClangFormatCategory));
+
 static cl::list<std::string> FileNames(cl::Positional, cl::desc("[<file> ...]"),
                                        cl::cat(ClangFormatCategory));
+
+static bool checkMultipleFilesPreconditions() {
+  if (FileNames.size() != 1 &&
+      (!Offsets.empty() || !Lengths.empty() || !LineRanges.empty())) {
+    errs() << "error: -offset, -length and -lines can only be used for "
+              "single file.\n";
+    return true;
+  }
+
+  return false;
+}
 
 namespace clang {
 namespace format {
@@ -329,6 +345,51 @@ static bool format(StringRef FileName) {
   return false;
 }
 
+bool findMatchingFiles(std::vector<std::string> &files) {
+  SmallVector<char, 256> currentPath;
+  std::error_code ec;
+  llvm::sys::fs::file_status fileStatus;
+  llvm::sys::fs::current_path(currentPath);
+
+  for (llvm::sys::fs::recursive_directory_iterator I(currentPath, ec), E;
+       I != E; I.increment(ec)) {
+    if (ec) {
+      errs() << "error: error wile recursive files formatting. Error code: "
+             << ec.value();
+      return true;
+    }
+
+    I->status(fileStatus);
+
+    if (fileStatus.type() == llvm::sys::fs::file_type::regular_file) {
+      std::vector<Regex> regexs{std::cbegin(FileNames), std::cend(FileNames)};
+
+      for (auto &regex : regexs) {
+        if (regex.match(I->path())) {
+          files.push_back(I->path());
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool formatRecusively() {
+  std::vector<std::string> files;
+  if (checkMultipleFilesPreconditions() || findMatchingFiles(files)) {
+    return false;
+  }
+
+  bool Error = false;
+
+  for (unsigned i = 0; i < files.size(); ++i) {
+    Error |= clang::format::format(files[i]);
+  }
+
+  return Error;
+}
+
 }  // namespace format
 }  // namespace clang
 
@@ -368,14 +429,16 @@ int main(int argc, const char **argv) {
     return 0;
   }
 
+  if (Recursively) {
+    return clang::format::formatRecusively();
+  }
+
   bool Error = false;
   if (FileNames.empty()) {
     Error = clang::format::format("-");
     return Error ? 1 : 0;
   }
-  if (FileNames.size() != 1 && (!Offsets.empty() || !Lengths.empty() || !LineRanges.empty())) {
-    errs() << "error: -offset, -length and -lines can only be used for "
-              "single file.\n";
+  if (checkMultipleFilesPreconditions()) {
     return 1;
   }
   for (const auto &FileName : FileNames) {
